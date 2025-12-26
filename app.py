@@ -29,6 +29,39 @@ IS_ADMIN_ROUTE = params.get("admin") == "1"
 
 
 # =========================
+# Helpers
+# =========================
+def normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def is_valid_email(email: str) -> bool:
+    # validação leve (suficiente para MVP)
+    # evita travar usuário com regras complexas
+    if not email:
+        return False
+    if "@" not in email:
+        return False
+    if "." not in email.split("@")[-1]:
+        return False
+    if email.startswith("@") or email.endswith("@"):
+        return False
+    return True
+
+
+def mask_email(email: str) -> str:
+    email = normalize_email(email)
+    if "@" not in email:
+        return "***"
+    user, domain = email.split("@", 1)
+    if len(user) <= 2:
+        user_mask = user[:1] + "***"
+    else:
+        user_mask = user[:2] + "***"
+    return f"{user_mask}@{domain}"
+
+
+# =========================
 # Banco (SQLite)
 # =========================
 def get_conn():
@@ -248,7 +281,6 @@ st.caption("Antes de gastar, entenda o porquê. 1 pergunta por dia → padrões 
 # =========================
 # ADMIN (invisível para usuários)
 # =========================
-# Se for admin route, mostramos admin SEM exigir user_id
 if IS_ADMIN_ROUTE:
     st.markdown("---")
     st.subheader("🔒 Área administrativa")
@@ -265,6 +297,7 @@ if IS_ADMIN_ROUTE:
             cur.execute("SELECT COUNT(1) FROM respostas")
             total_all = int(cur.fetchone()[0])
 
+            # últimos 100 registros
             cur.execute(
                 """
                 SELECT user_id, dt_ref, gasto_nao_planejado,
@@ -279,11 +312,19 @@ if IS_ADMIN_ROUTE:
             conn.close()
 
             st.write(f"**Total de respostas (todos os usuários): {total_all}**")
+
+            # mascara e-mail antes de exibir
+            rows_masked = []
+            for r in rows:
+                r = list(r)
+                r[0] = mask_email(r[0])
+                rows_masked.append(r)
+
             st.dataframe(
-                rows,
+                rows_masked,
                 use_container_width=True,
                 column_config={
-                    0: "user_id",
+                    0: "email (mascarado)",
                     1: "dt_ref",
                     2: "gasto",
                     3: "motivo",
@@ -292,26 +333,31 @@ if IS_ADMIN_ROUTE:
                     6: "updated_at",
                 },
             )
-            st.caption("Dica: evite compartilhar prints dessa tabela (privacidade).")
+            st.caption("Dica: evite compartilhar prints (privacidade).")
         else:
             st.error("Senha incorreta.")
 
-    # Opcional: para não mostrar a experiência normal aos admins,
-    # você pode parar aqui. Se quiser ver o app também, comente o st.stop().
+    # Admin não mistura com app normal
     st.stop()
 
 # =========================
 # APP NORMAL (usuários)
 # =========================
 st.sidebar.header("Perfil")
-user_id = st.sidebar.text_input("Seu identificador (ex: email ou apelido)", value="").strip()
-st.sidebar.caption("Dica: use sempre o mesmo identificador para manter seu histórico.")
+email = normalize_email(
+    st.sidebar.text_input("Seu e-mail", placeholder="ex: nome@email.com", value="")
+)
+st.sidebar.caption("Dica: use sempre o mesmo e-mail para manter seu histórico.")
 
-# Aqui está a correção do “ficou estranho”:
-# usuário normal precisa de user_id; admin não entra aqui (já deu stop acima)
-if not user_id:
-    st.info("Digite seu identificador na barra lateral para começar.")
+if not email:
+    st.info("Digite seu e-mail na barra lateral para começar.")
     st.stop()
+
+if not is_valid_email(email):
+    st.warning("Digite um e-mail válido (ex: nome@email.com).")
+    st.stop()
+
+user_id = email  # padronizado
 
 # Data do dia (BR)
 hoje = datetime.now(TZ).date()
