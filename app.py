@@ -18,7 +18,7 @@ st.set_page_config(
 )
 
 TZ = ZoneInfo("America/Sao_Paulo")
-DB_PATH = "por_que_gastei.db"
+DB_PATH = "por_que_gastei_v2.db"
 
 # Admin invisível via query param
 params = st.query_params
