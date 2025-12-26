@@ -47,7 +47,7 @@ def table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str):
-    """Garante que a coluna existe (migração simples para MVP)."""
+    """Garante que a coluna existe (migração simples para)."""
     if not table_exists(conn, table):
         return
     cur = conn.cursor()
@@ -324,7 +324,7 @@ def idx_or_default(options: list[str], value: str, default: int = 0) -> int:
 # UI (Streamlit)
 # -----------------------------
 def main():
-    st.set_page_config(page_title="Antes de Gastar (MVP)", page_icon="💸", layout="centered")
+    st.set_page_config(page_title="Antes de Gastar", page_icon="💸", layout="centered")
     init_db()
 
     st.title("💸 Antes de Gastar")
