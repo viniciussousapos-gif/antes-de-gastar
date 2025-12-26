@@ -328,7 +328,7 @@ def main():
     init_db()
 
     st.title("💸 Antes de Gastar")
-    st.caption("Antes de gastar, entenda o porquê. (MVP: 1 pergunta por dia → padrões simples → mais consciência.)")
+    st.caption("Antes de gastar, entenda o porquê. 1 pergunta por dia → padrões simples → mais consciência.")
 
     with st.sidebar:
         st.header("Perfil")
