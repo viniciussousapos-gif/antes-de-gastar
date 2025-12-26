@@ -39,80 +39,59 @@ def get_conn():
 
 
 def init_db():
-    conn = get_conn()
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    # Usuários
-    cur.execute(
-        """
+    # -------------------------
+    # USERS
+    # -------------------------
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,         -- apelido único
-            email TEXT UNIQUE,                     -- opcional, mas se tiver, único
-            salt TEXT NOT NULL,
+            user_key TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            apelido TEXT UNIQUE,
             password_hash TEXT NOT NULL,
             created_at TEXT NOT NULL
-        );
-        """
-    )
+        )
+    """)
 
-    # Respostas
-    cur.execute(
-        """
+    # -------------------------
+    # RESPOSTAS
+    # -------------------------
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS respostas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_key TEXT NOT NULL,                -- username (apelido)
-            dt_ref TEXT NOT NULL,                  -- YYYY-MM-DD
-            gasto_nao_planejado INTEGER NOT NULL,  -- 0/1
+            user_key TEXT,
+            dt_ref TEXT,
+            gasto_nao_planejado INTEGER,
             motivo TEXT,
             momento TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        """
-    )
-    # ==============================
-    # MIGRAÇÃO PARA BANCO ANTIGO
-    # ==============================
-    def _colunas(nome_tabela):
-        cur.execute(f"PRAGMA table_info({nome_tabela})")
-        return {c[1] for c in cur.fetchall()}
+            created_at TEXT
+        )
+    """)
 
-    cols = _colunas("respostas")
+    # -------------------------
+    # MIGRAÇÃO: respostas.user_key (para bancos antigos)
+    # -------------------------
+    cur.execute("PRAGMA table_info(respostas)")
+    colunas = {c[1] for c in cur.fetchall()}
 
-    if "user_key" not in cols:
+    if "user_key" not in colunas:
         cur.execute("ALTER TABLE respostas ADD COLUMN user_key TEXT")
 
-        # tenta reaproveitar colunas antigas
-        if "user_id" in cols:
-            cur.execute("""
-                UPDATE respostas
-                SET user_key = user_id
-                WHERE user_key IS NULL
-            """)
-        elif "user" in cols:
-            cur.execute("""
-                UPDATE respostas
-                SET user_key = user
-                WHERE user_key IS NULL
-            """)
+        # tenta copiar de colunas antigas (se existirem)
+        if "user_id" in colunas:
+            cur.execute("UPDATE respostas SET user_key = user_id WHERE user_key IS NULL")
 
-    # índice único por usuário + dia
+    # Índice único por usuário + dia
     cur.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS
-        idx_respostas_user_dia
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_respostas_user_dia
         ON respostas(user_key, dt_ref)
     """)
 
-    cur.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_respostas_user_dia
-        ON respostas(user_key, dt_ref);
-        """
-    )
-
     conn.commit()
     conn.close()
+
 
 
 init_db()
