@@ -1,50 +1,105 @@
-import sqlite3
 import os
+import re
+import time
 import hmac
+import uuid
+import sqlite3
 import hashlib
-import secrets
 from datetime import datetime, date, timedelta
-from zoneinfo import ZoneInfo
-
 import streamlit as st
 
+
 # =========================
-# Config da página
+# CONFIG
 # =========================
-st.set_page_config(
-    page_title="Antes de Gastar",
-    page_icon="🧠",
-    layout="centered",
-)
+APP_NAME = "Antes de Gastar"
+APP_SUBTITLE = "Antes de gastar, entenda o porquê. 1 pergunta por dia → padrões simples → mais consciência."
 
-TZ = ZoneInfo("America/Sao_Paulo")
-DB_PATH = "por_que_gastei_v2.db"
+# Banco: em Cloud, prefira um path relativo. Vamos criar pasta "data" no repo.
+DB_DIR = os.getenv("DB_DIR", "data")
+DB_PATH = os.getenv("DB_PATH", os.path.join(DB_DIR, "por_que_gastei.db"))
 
-# Admin invisível via query param
-params = st.query_params
-IS_ADMIN_ROUTE = params.get("admin") == "1"
-
-# Troque depois
-ADMIN_PASSWORD = "admin123"
-
-# Pepper opcional (melhora segurança). Ideal colocar em Secrets/Env do Streamlit Cloud.
-PEPPER = os.environ.get("APP_PEPPER", "change-me-pepper")
+# Admin: defina no Streamlit Cloud em Settings -> Secrets:
+# ADMIN_PASSWORD = "uma_senha_forte"
+ADMIN_PASSWORD = None
+try:
+    ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", None)
+except Exception:
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
 
 # =========================
-# DB
+# HELPERS
 # =========================
+def now_iso():
+    # ISO com timezone "local" simplificado
+    return datetime.now().isoformat(timespec="seconds")
+
+def today_str():
+    return date.today().isoformat()
+
+def normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+def normalize_apelido(apelido: str) -> str:
+    # apelido simples (sem espaços extremos)
+    return (apelido or "").strip()
+
+def is_valid_email(email: str) -> bool:
+    email = normalize_email(email)
+    # regex simples (suficiente para MVP)
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
+
+def ensure_db_dir():
+    os.makedirs(DB_DIR, exist_ok=True)
+
 def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    ensure_db_dir()
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
 
+
+# =========================
+# PASSWORD HASHING (PBKDF2)
+# =========================
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    if salt is None:
+        salt = os.urandom(16)
+    pw = password.encode("utf-8")
+    dk = hashlib.pbkdf2_hmac("sha256", pw, salt, 200_000)
+    return f"pbkdf2_sha256$200000${salt.hex()}${dk.hex()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iters, salt_hex, hash_hex = stored.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        salt = bytes.fromhex(salt_hex)
+        test = hash_password(password, salt)
+        # comparação constante
+        return hmac.compare_digest(test, stored)
+    except Exception:
+        return False
+
+
+# =========================
+# DB INIT + MIGRATIONS
+# =========================
+def table_columns(cur, table_name: str) -> set[str]:
+    cur.execute(f"PRAGMA table_info({table_name})")
+    return {row[1] for row in cur.fetchall()}
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    """
+    Cria tabelas e MIGRA o schema antigo (Cloud) para evitar:
+    sqlite3.OperationalError: no such column: user_key
+    """
+    conn = get_conn()
     cur = conn.cursor()
 
-    # -------------------------
-    # USERS
-    # -------------------------
+    # 1) users
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_key TEXT PRIMARY KEY,
@@ -55,9 +110,27 @@ def init_db():
         )
     """)
 
-    # -------------------------
-    # RESPOSTAS
-    # -------------------------
+    # 2) password resets (para "esqueci a senha" sem email ainda)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS password_resets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            token TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_password_resets_email
+        ON password_resets(email)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_password_resets_token
+        ON password_resets(token)
+    """)
+
+    # 3) respostas
+    # Criamos com user_key. Se já existir antigo, faremos ALTER TABLE abaixo.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS respostas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,19 +144,19 @@ def init_db():
     """)
 
     # -------------------------
-    # MIGRAÇÃO: respostas.user_key (para bancos antigos)
+    # MIGRAÇÃO: respostas.user_key
     # -------------------------
-    cur.execute("PRAGMA table_info(respostas)")
-    colunas = {c[1] for c in cur.fetchall()}
-
-    if "user_key" not in colunas:
+    cols = table_columns(cur, "respostas")
+    if "user_key" not in cols:
         cur.execute("ALTER TABLE respostas ADD COLUMN user_key TEXT")
 
-        # tenta copiar de colunas antigas (se existirem)
-        if "user_id" in colunas:
+        # tenta reaproveitar colunas antigas se existirem
+        if "user_id" in cols:
             cur.execute("UPDATE respostas SET user_key = user_id WHERE user_key IS NULL")
+        elif "user" in cols:
+            cur.execute("UPDATE respostas SET user_key = user WHERE user_key IS NULL")
 
-    # Índice único por usuário + dia
+    # Índice único por usuário + dia (para upsert lógico)
     cur.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_respostas_user_dia
         ON respostas(user_key, dt_ref)
@@ -93,516 +166,473 @@ def init_db():
     conn.close()
 
 
-
-init_db()
-
-
 # =========================
-# Auth helpers
+# USERS CRUD
 # =========================
-def normalize(s: str) -> str:
-    return (s or "").strip()
+def create_user(email: str, apelido: str, password: str) -> tuple[bool, str]:
+    email = normalize_email(email)
+    apelido = normalize_apelido(apelido)
 
+    if not is_valid_email(email):
+        return False, "Email inválido."
+    if len(password or "") < 6:
+        return False, "Senha muito curta. Use pelo menos 6 caracteres."
+    if apelido and len(apelido) < 2:
+        return False, "Apelido muito curto."
 
-def normalize_email(s: str) -> str:
-    return normalize(s).lower()
-
-
-def normalize_username(s: str) -> str:
-    return normalize(s).lower()
-
-
-def is_valid_email(email: str) -> bool:
-    if not email:
-        return False
-    if "@" not in email:
-        return False
-    if "." not in email.split("@")[-1]:
-        return False
-    return True
-
-
-def pbkdf2_hash(password: str, salt_hex: str) -> str:
-    salt = bytes.fromhex(salt_hex)
-    dk = hashlib.pbkdf2_hmac(
-        "sha256",
-        (password + PEPPER).encode("utf-8"),
-        salt,
-        200_000,
-        dklen=32,
-    )
-    return dk.hex()
-
-
-def create_user(username: str, password: str, email: str | None):
-    username = normalize_username(username)
-    email = normalize_email(email) if email else None
-
-    if not username:
-        return False, "Digite um apelido."
-    if len(username) < 3:
-        return False, "Seu apelido deve ter pelo menos 3 caracteres."
-    if not password or len(password) < 6:
-        return False, "Sua senha deve ter pelo menos 6 caracteres."
-    if email and not is_valid_email(email):
-        return False, "Digite um e-mail válido (ou deixe em branco)."
+    user_key = uuid.uuid4().hex
+    pw_hash = hash_password(password)
 
     conn = get_conn()
     cur = conn.cursor()
 
-    # apelido já existe?
-    cur.execute("SELECT 1 FROM users WHERE username = ?", (username,))
+    # checa duplicados
+    cur.execute("SELECT 1 FROM users WHERE email = ?", (email,))
     if cur.fetchone():
         conn.close()
-        return False, "Esse apelido já existe. Tente outro."
+        return False, "Este email já existe. Faça login."
 
-    # email já existe?
-    if email:
-        cur.execute("SELECT 1 FROM users WHERE email = ?", (email,))
+    if apelido:
+        cur.execute("SELECT 1 FROM users WHERE apelido = ?", (apelido,))
         if cur.fetchone():
             conn.close()
-            return False, "Esse e-mail já está cadastrado. Tente fazer login."
+            return False, "Este apelido já existe. Escolha outro."
 
-    salt_hex = secrets.token_hex(16)
-    pw_hash = pbkdf2_hash(password, salt_hex)
-    now = datetime.now(TZ).isoformat(timespec="seconds")
-
-    cur.execute(
-        """
-        INSERT INTO users (username, email, salt, password_hash, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (username, email, salt_hex, pw_hash, now),
-    )
+    cur.execute("""
+        INSERT INTO users(user_key, email, apelido, password_hash, created_at)
+        VALUES(?,?,?,?,?)
+    """, (user_key, email, apelido if apelido else None, pw_hash, now_iso()))
     conn.commit()
     conn.close()
-    return True, "Conta criada com sucesso! Agora faça login."
+    return True, "Conta criada com sucesso! Faça login."
 
-
-def verify_login(login: str, password: str):
-    login = normalize(login).lower()
-    if not login or not password:
-        return False, "Preencha login e senha.", None
-
+def auth_user(email: str, password: str) -> tuple[bool, dict | None, str]:
+    email = normalize_email(email)
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute(
-        """
-        SELECT username, salt, password_hash
+    cur.execute("""
+        SELECT user_key, email, apelido, password_hash
         FROM users
-        WHERE username = ? OR email = ?
-        """,
-        (login, login),
-    )
+        WHERE email = ?
+    """, (email,))
     row = cur.fetchone()
     conn.close()
 
     if not row:
-        return False, "Usuário/e-mail não encontrado.", None
+        return False, None, "Email não encontrado. Crie uma conta."
+    user_key, email_db, apelido_db, pw_hash = row
 
-    username, salt_hex, stored_hash = row
-    calc = pbkdf2_hash(password, salt_hex)
+    if not verify_password(password, pw_hash):
+        return False, None, "Senha incorreta."
 
-    if not hmac.compare_digest(calc, stored_hash):
-        return False, "Senha incorreta.", None
+    return True, {
+        "user_key": user_key,
+        "email": email_db,
+        "apelido": apelido_db
+    }, "OK"
 
-    return True, "Login realizado.", username
+def request_password_reset(email: str) -> tuple[bool, str]:
+    email = normalize_email(email)
+    if not is_valid_email(email):
+        return False, "Email inválido."
 
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM users WHERE email = ?", (email,))
+    if not cur.fetchone():
+        conn.close()
+        return False, "Não existe conta com esse email."
 
-def reset_password(username_or_email: str, new_password: str):
-    """
-    Reset manual via admin:
-    - procura por username OU email
-    - atualiza salt + hash
-    """
-    login = normalize(username_or_email).lower()
-    if not login:
-        return False, "Digite o apelido ou e-mail do usuário."
+    token = uuid.uuid4().hex
+    expires = (datetime.now() + timedelta(hours=1)).isoformat(timespec="seconds")
 
-    if not new_password or len(new_password) < 6:
-        return False, "A nova senha deve ter pelo menos 6 caracteres."
+    cur.execute("""
+        INSERT INTO password_resets(email, token, expires_at, used_at)
+        VALUES(?,?,?,NULL)
+    """, (email, token, expires))
+    conn.commit()
+    conn.close()
+
+    # Como ainda não enviamos email:
+    # devolvemos o link/código pra você copiar e mandar para a pessoa.
+    return True, token
+
+def reset_password_with_token(token: str, new_password: str) -> tuple[bool, str]:
+    token = (token or "").strip()
+    if len(new_password or "") < 6:
+        return False, "Senha muito curta. Use pelo menos 6 caracteres."
 
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute(
-        """
-        SELECT username
-        FROM users
-        WHERE username = ? OR email = ?
-        """,
-        (login, login),
-    )
+    cur.execute("""
+        SELECT email, expires_at, used_at
+        FROM password_resets
+        WHERE token = ?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (token,))
     row = cur.fetchone()
-
     if not row:
         conn.close()
-        return False, "Usuário não encontrado."
+        return False, "Token inválido."
+    email, expires_at, used_at = row
 
-    username = row[0]
+    if used_at:
+        conn.close()
+        return False, "Este token já foi usado."
 
-    salt_hex = secrets.token_hex(16)
-    pw_hash = pbkdf2_hash(new_password, salt_hex)
+    try:
+        exp_dt = datetime.fromisoformat(expires_at)
+        if datetime.now() > exp_dt:
+            conn.close()
+            return False, "Token expirado. Gere outro."
+    except Exception:
+        conn.close()
+        return False, "Token inválido (formato)."
 
-    cur.execute(
-        """
-        UPDATE users
-        SET salt = ?, password_hash = ?
-        WHERE username = ?
-        """,
-        (salt_hex, pw_hash, username),
-    )
+    pw_hash = hash_password(new_password)
+
+    cur.execute("UPDATE users SET password_hash = ? WHERE email = ?", (pw_hash, email))
+    cur.execute("UPDATE password_resets SET used_at = ? WHERE token = ?", (now_iso(), token))
     conn.commit()
     conn.close()
-
-    return True, f"Senha resetada com sucesso para '{username}'."
+    return True, "Senha atualizada com sucesso! Faça login."
 
 
 # =========================
-# Data helpers
+# RESPOSTAS CRUD
 # =========================
 def upsert_resposta(user_key: str, dt_ref: str, gasto: int, motivo: str | None, momento: str | None):
-    now = datetime.now(TZ).isoformat(timespec="seconds")
     conn = get_conn()
     cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO respostas (user_key, dt_ref, gasto_nao_planejado, motivo, momento, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_key, dt_ref) DO UPDATE SET
+    # se existe (user_key, dt_ref) atualiza; senão insere.
+    cur.execute("""
+        INSERT INTO respostas(user_key, dt_ref, gasto_nao_planejado, motivo, momento, created_at)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(user_key, dt_ref)
+        DO UPDATE SET
             gasto_nao_planejado = excluded.gasto_nao_planejado,
             motivo = excluded.motivo,
             momento = excluded.momento,
-            updated_at = excluded.updated_at
-        """,
-        (user_key, dt_ref, gasto, motivo, momento, now, now),
-    )
-
+            created_at = excluded.created_at
+    """, (user_key, dt_ref, int(gasto), motivo, momento, now_iso()))
     conn.commit()
     conn.close()
-
 
 def get_resposta_do_dia(user_key: str, dt_ref: str):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT dt_ref, gasto_nao_planejado, COALESCE(motivo,''), COALESCE(momento,''),
-               created_at, updated_at
+    cur.execute("""
+        SELECT dt_ref, gasto_nao_planejado, COALESCE(motivo,''), COALESCE(momento,''), created_at
         FROM respostas
         WHERE user_key = ? AND dt_ref = ?
-        """,
-        (user_key, dt_ref),
-    )
+    """, (user_key, dt_ref))
     row = cur.fetchone()
     conn.close()
     return row
 
-
 def get_historico(user_key: str, limit: int = 60):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        """
+    cur.execute("""
         SELECT dt_ref, gasto_nao_planejado, COALESCE(motivo,''), COALESCE(momento,''), created_at
         FROM respostas
         WHERE user_key = ?
         ORDER BY dt_ref DESC
         LIMIT ?
-        """,
-        (user_key, limit),
-    )
+    """, (user_key, int(limit)))
     rows = cur.fetchall()
     conn.close()
     return rows
 
-
-def get_ultimos_dias(user_key: str, dias: int = 7):
-    fim = date.today()
-    inicio = fim - timedelta(days=dias - 1)
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT dt_ref, gasto_nao_planejado, COALESCE(motivo,''), COALESCE(momento,'')
-        FROM respostas
-        WHERE user_key = ?
-          AND date(dt_ref) BETWEEN date(?) AND date(?)
-        ORDER BY dt_ref ASC
-        """,
-        (user_key, inicio.isoformat(), fim.isoformat()),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def insight_7_dias(rows_7d):
-    if not rows_7d:
+def insight_ultimos_7_dias(user_key: str):
+    rows = get_historico(user_key, limit=120)
+    if not rows:
         return None
 
-    total = len(rows_7d)
-    dias_com_gasto = sum(1 for r in rows_7d if int(r[1]) == 1)
-    pct = round((dias_com_gasto / total) * 100) if total else 0
+    # filtra últimos 7 dias
+    hoje = date.today()
+    recents = []
+    for dt_ref, gasto, motivo, momento, created_at in rows:
+        try:
+            d = date.fromisoformat(dt_ref)
+        except Exception:
+            continue
+        if (hoje - d).days <= 6:
+            recents.append((d, gasto, motivo, momento))
+
+    if not recents:
+        return None
+
+    total_dias = len({d for d, *_ in recents})
+    dias_com_gasto = len({d for d, gasto, *_ in recents if int(gasto) == 1})
 
     motivos = {}
     momentos = {}
-    for _, gasto, motivo, momento in rows_7d:
+    for d, gasto, motivo, momento in recents:
         if int(gasto) == 1:
             if motivo:
                 motivos[motivo] = motivos.get(motivo, 0) + 1
             if momento:
                 momentos[momento] = momentos.get(momento, 0) + 1
 
-    motivo_top = max(motivos, key=motivos.get) if motivos else None
-    momento_top = max(momentos, key=momentos.get) if momentos else None
+    top_motivo = max(motivos, key=motivos.get) if motivos else None
+    top_momento = max(momentos, key=momentos.get) if momentos else None
 
-    partes = [f"Nos últimos 7 dias, gastos não planejados ocorreram em **{pct}%** dos dias respondidos."]
-    if motivo_top:
-        partes.append(f"Motivo mais comum: **{motivo_top}**.")
-    if momento_top:
-        partes.append(f"Momento mais comum: **{momento_top.lower()}**.")
-    partes.append("Perceber o padrão é o primeiro passo para mudar.")
-
-    return " ".join(partes)
-
-
-def sugestao_por_motivo(motivo_top: str | None):
-    if not motivo_top:
-        return "Antes do próximo gasto, faça uma pausa curta e pergunte: “isso resolve o que eu estou sentindo agora?”"
-    m = motivo_top.lower()
-    if "pressão" in m:
-        return "Respire 10s e pergunte: “eu compraria isso se ninguém estivesse olhando?”"
-    if "recompensa" in m or "mereço" in m:
-        return "Pergunte: “qual recompensa menor (e suficiente) eu posso escolher agora?”"
-    if "ansiedade" in m or "estresse" in m:
-        return "Faça uma pausa de 60s (água + respiração) e reavalie."
-    if "tédio" in m:
-        return "Faça uma alternativa de 2 min (andar/alongar/música) e reavalie."
-    return "Antes do próximo gasto, faça uma pausa curta e pergunte: “isso resolve o que eu estou sentindo agora?”"
+    return {
+        "total_dias": total_dias,
+        "dias_com_gasto": dias_com_gasto,
+        "pct": round((dias_com_gasto / max(total_dias, 1)) * 100),
+        "top_motivo": top_motivo,
+        "top_momento": top_momento,
+    }
 
 
 # =========================
 # UI
 # =========================
-st.markdown("## 🧠 Antes de Gastar")
-st.caption("Antes de gastar, entenda o porquê. 1 pergunta por dia → padrões simples → mais consciência.")
+st.set_page_config(page_title=APP_NAME, page_icon="🧠", layout="wide")
+
+# garante migração sempre no começo (CRÍTICO para Cloud)
+init_db()
 
 
-# =========================
-# ADMIN invisível + reset senha
-# =========================
-if IS_ADMIN_ROUTE:
-    st.markdown("---")
-    st.subheader("🔒 Área administrativa")
+def sidebar_account():
+    st.sidebar.markdown("## Conta")
 
-    senha = st.text_input("Senha admin", type="password")
-    if senha:
-        if senha == ADMIN_PASSWORD:
-            st.success("Acesso liberado.")
+    # sessão
+    if "auth" not in st.session_state:
+        st.session_state.auth = None  # dict com user_key/email/apelido
 
-            # Painel simples
-            conn = get_conn()
-            cur = conn.cursor()
+    if st.session_state.auth:
+        u = st.session_state.auth
+        label = u.get("apelido") or u.get("email")
+        st.sidebar.success(f"Logado como: {label}")
+        if st.sidebar.button("Sair"):
+            st.session_state.auth = None
+            st.rerun()
+        return
 
-            cur.execute("SELECT COUNT(1) FROM users")
-            tot_users = int(cur.fetchone()[0])
+    tab_login, tab_signup, tab_forgot = st.sidebar.tabs(["Entrar", "Criar conta", "Esqueci a senha"])
 
-            cur.execute("SELECT COUNT(1) FROM respostas")
-            tot_resp = int(cur.fetchone()[0])
+    with tab_login:
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Senha", type="password", key="login_password")
+        if st.button("Entrar", key="btn_login"):
+            ok, user, msg = auth_user(email, password)
+            if ok:
+                st.session_state.auth = user
+                st.rerun()
+            else:
+                st.error(msg)
 
-            st.write(f"**Usuários:** {tot_users}  |  **Respostas:** {tot_resp}")
-
-            st.markdown("### 🔁 Reset de senha (manual)")
-            target = st.text_input("Apelido ou e-mail do usuário", key="adm_target")
-            new_pw = st.text_input("Nova senha (mín. 6)", type="password", key="adm_newpw")
-
-            if st.button("Resetar senha", key="adm_reset_btn"):
-                ok, msg = reset_password(target, new_pw)
+    with tab_signup:
+        email = st.text_input("Email", key="signup_email")
+        apelido = st.text_input("Apelido (opcional)", key="signup_apelido")
+        password = st.text_input("Senha", type="password", key="signup_password")
+        password2 = st.text_input("Confirmar senha", type="password", key="signup_password2")
+        if st.button("Criar conta", key="btn_signup"):
+            if password != password2:
+                st.error("As senhas não conferem.")
+            else:
+                ok, msg = create_user(email, apelido, password)
                 if ok:
                     st.success(msg)
                 else:
                     st.error(msg)
 
-            st.markdown("### Últimas respostas (100)")
-            cur.execute(
-                """
-                SELECT user_key, dt_ref, gasto_nao_planejado,
-                       COALESCE(motivo,''), COALESCE(momento,''),
-                       created_at, updated_at
-                FROM respostas
-                ORDER BY updated_at DESC
-                LIMIT 100
-                """
-            )
-            rows = cur.fetchall()
-            conn.close()
+    with tab_forgot:
+        st.caption("Sem email automático por enquanto. Vamos gerar um token para você copiar e enviar.")
+        email = st.text_input("Seu email", key="forgot_email")
+        if st.button("Gerar token de reset", key="btn_forgot"):
+            ok, out = request_password_reset(email)
+            if ok:
+                token = out
+                st.success("Token gerado! Copie o link abaixo (vale por 1 hora):")
+                # link baseado no próprio app
+                base = st.get_option("server.baseUrlPath") or ""
+                # Streamlit não dá URL absoluta fácil; deixamos token para colar no campo abaixo
+                st.code(token)
+                st.info("Agora vá na aba 'Reset' (no topo do app) e cole o token.")
+            else:
+                st.error(out)
 
-            st.dataframe(rows, use_container_width=True)
-            st.caption("Dica: evite compartilhar prints (privacidade).")
+    st.sidebar.markdown("---")
+    st.sidebar.caption("Dica: use sempre o email para evitar colisão de nomes.")
 
+
+def main_header():
+    c1, c2, c3 = st.columns([1, 6, 1])
+    with c2:
+        st.markdown(f"# 🧠 {APP_NAME}")
+        st.caption(APP_SUBTITLE)
+        st.markdown("---")
+
+
+def page_reset_password():
+    st.markdown("## Reset de senha")
+    st.caption("Cole o token gerado na aba 'Esqueci a senha' e defina uma nova senha.")
+    token = st.text_input("Token")
+    new_password = st.text_input("Nova senha", type="password")
+    new_password2 = st.text_input("Confirmar nova senha", type="password")
+    if st.button("Atualizar senha"):
+        if new_password != new_password2:
+            st.error("As senhas não conferem.")
+            return
+        ok, msg = reset_password_with_token(token, new_password)
+        if ok:
+            st.success(msg)
         else:
-            st.error("Senha incorreta.")
-
-    st.stop()
+            st.error(msg)
 
 
-# =========================
-# Auth na sidebar
-# =========================
-if "auth_user" not in st.session_state:
-    st.session_state.auth_user = None
+def page_app():
+    if not st.session_state.auth:
+        st.info("Faça login ou crie uma conta na barra lateral para começar.")
+        return
 
-st.sidebar.header("Conta")
+    user_key = st.session_state.auth["user_key"]
+    dt_ref = today_str()
 
-if st.session_state.auth_user:
-    st.sidebar.success(f"Logado como: {st.session_state.auth_user}")
-    if st.sidebar.button("Sair"):
-        st.session_state.auth_user = None
-        st.rerun()
-else:
-    tab_login, tab_signup = st.sidebar.tabs(["Entrar", "Criar conta"])
+    st.markdown("## Pergunta de hoje")
+    st.markdown("**Hoje você gastou com algo que não planejava?**")
 
-    with tab_login:
-        login = st.text_input("E-mail ou apelido", key="login_login")
-        senha = st.text_input("Senha", type="password", key="login_senha")
-        if st.button("Entrar", key="btn_entrar"):
-            ok, msg, username = verify_login(login, senha)
-            if ok:
-                st.session_state.auth_user = username
-                st.sidebar.success(msg)
-                st.rerun()
-            else:
-                st.sidebar.error(msg)
+    row = get_resposta_do_dia(user_key, dt_ref)
 
-        st.caption("Esqueceu a senha? Fale com o criador do app para reset manual.")
-
-    with tab_signup:
-        username = st.text_input("Apelido (único)", key="signup_username")
-        email = st.text_input("E-mail (opcional)", key="signup_email")
-        senha = st.text_input("Senha (mín. 6)", type="password", key="signup_pw")
-        if st.button("Criar conta", key="btn_criar"):
-            ok, msg = create_user(username, senha, email if email.strip() else None)
-            if ok:
-                st.sidebar.success(msg)
-            else:
-                st.sidebar.error(msg)
-
-# Bloqueia app se não logou
-if not st.session_state.auth_user:
-    st.info("Faça login (ou crie uma conta) na barra lateral para começar.")
-    st.stop()
-
-user_key = st.session_state.auth_user
-
-# =========================
-# App principal
-# =========================
-hoje = datetime.now(TZ).date()
-dt_ref = hoje.isoformat()
-
-st.markdown("---")
-st.subheader("Pergunta de hoje")
-st.write("**Hoje você gastou com algo que não planejava?**")
-
-row = get_resposta_do_dia(user_key, dt_ref)
-
-default_gasto = 0
-default_motivo = ""
-default_momento = ""
-
-if row:
-    _, gasto_salvo, motivo_salvo, momento_salvo, created_at, updated_at = row
-    default_gasto = int(gasto_salvo)
-    default_motivo = motivo_salvo or ""
-    default_momento = momento_salvo or ""
-    st.info(
-        f"Resposta registrada hoje em **{created_at}**."
-        + (f" Última atualização: **{updated_at}**." if updated_at and updated_at != created_at else "")
-        + " Você pode editar e salvar novamente se quiser."
-    )
-
-gasto_txt = st.radio(
-    "Escolha uma opção:",
-    options=["Não", "Sim"],
-    index=1 if default_gasto == 1 else 0,
-)
-
-gasto = 1 if gasto_txt == "Sim" else 0
-
-motivos_opcoes = [
-    "",
-    "Pressão social",
-    "Recompensa (\"eu mereço\")",
-    "Ansiedade / estresse",
-    "Tédio",
-    "Impulso / promoção",
-    "Fome / cansaço",
-    "Outro",
-]
-
-motivo = ""
-momento = ""
-
-if gasto == 1:
-    motivo = st.selectbox(
-        "O que mais influenciou esse gasto?",
-        options=motivos_opcoes,
-        index=motivos_opcoes.index(default_motivo) if default_motivo in motivos_opcoes else 0,
-    )
-    momento = st.radio(
-        "Em que momento do dia isso aconteceu?",
-        options=["Manhã", "Tarde", "Noite"],
-        index=["Manhã", "Tarde", "Noite"].index(default_momento) if default_momento in ["Manhã", "Tarde", "Noite"] else 0,
-        horizontal=True,
-    )
-
-st.caption("Sugestão: " + (sugestao_por_motivo(motivo if motivo else None) if gasto == 1 else "Ótimo. Manter consistência também é um padrão."))
-
-if st.button("Salvar resposta", type="primary"):
-    if gasto == 1 and not motivo:
-        st.warning("Selecione um motivo para salvar.")
+    if row:
+        _, gasto, motivo, momento, created_at = row
+        st.success(f"Resposta registrada hoje em **{dt_ref}**. Última atualização: **{created_at}**. Você pode editar e salvar novamente se quiser.")
     else:
-        upsert_resposta(user_key=user_key, dt_ref=dt_ref, gasto=gasto, motivo=motivo or None, momento=momento or None)
-        st.success("Resposta salva!")
+        gasto, motivo, momento = 0, "", ""
+
+    escolha = st.radio("Escolha uma opção:", ["Não", "Sim"], index=1 if int(gasto) == 1 else 0, horizontal=False)
+    gasto_val = 1 if escolha == "Sim" else 0
+
+    motivos_opcoes = [
+        "Pressão social",
+        "Recompensa (\"eu mereço\")",
+        "Ansiedade/estresse",
+        "Tédio",
+        "Promoção/impulso",
+        "Fome/vontade",
+        "Outro"
+    ]
+    motivo_sel = st.selectbox("O que mais influenciou esse gasto?", [""] + motivos_opcoes, index=([""] + motivos_opcoes).index(motivo) if motivo in motivos_opcoes else 0)
+    momento_sel = st.radio("Em que momento do dia isso aconteceu?", ["", "Manhã", "Tarde", "Noite"], index=(["", "Manhã", "Tarde", "Noite"].index(momento) if momento in ["Manhã","Tarde","Noite"] else 0), horizontal=True)
+
+    st.caption("Sugestão: antes do próximo gasto, faça uma pausa curta e pergunte: “isso resolve o que eu estou sentindo agora?”")
+
+    if st.button("Salvar resposta"):
+        # se marcou "Não", limpamos motivo/momento
+        m = motivo_sel if gasto_val == 1 else ""
+        mo = momento_sel if gasto_val == 1 else ""
+        upsert_resposta(user_key, dt_ref, gasto_val, m, mo)
         st.rerun()
 
-st.markdown("---")
-st.subheader("Insight (últimos 7 dias)")
-rows_7d = get_ultimos_dias(user_key, dias=7)
-ins = insight_7_dias(rows_7d)
-if not ins:
-    st.write("Ainda não há dados suficientes para gerar insights. Responda diariamente para começar.")
-else:
-    st.write(ins)
+    st.markdown("---")
+    st.markdown("## Insight (últimos 7 dias)")
+    ins = insight_ultimos_7_dias(user_key)
+    if not ins:
+        st.write("Ainda não há dados suficientes para gerar insights. Responda diariamente para começar.")
+    else:
+        txt = f"Nos últimos 7 dias, **{ins['pct']}%** dos seus dias tiveram gasto não planejado."
+        if ins["top_motivo"]:
+            txt += f" O motivo mais comum foi **{ins['top_motivo']}**."
+        if ins["top_momento"]:
+            txt += f" Esses episódios tendem a acontecer mais em **{ins['top_momento']}**."
+        st.write(txt)
 
-st.markdown("---")
-st.subheader("Histórico")
-hist = get_historico(user_key, limit=60)
-if not hist:
-    st.write("Sem histórico ainda. Responda a pergunta de hoje 🙂")
-else:
-    for dt_ref_i, gasto_i, motivo_i, momento_i, _created_at in hist[:20]:
-        status = "✅ Sim" if int(gasto_i) == 1 else "⬜ Não"
-        extras = []
-        if motivo_i:
-            extras.append(motivo_i)
-        if momento_i:
-            extras.append(momento_i.lower())
-        extra_txt = f" • " + " • ".join(extras) if extras else ""
-        st.write(f"**{dt_ref_i}** — {status}{extra_txt}")
+    st.markdown("---")
+    st.markdown("## Histórico")
+    hist = get_historico(user_key, limit=30)
+    if not hist:
+        st.write("Sem histórico ainda. Responda a pergunta de hoje 🙂")
+    else:
+        for dt_ref, gasto, motivo, momento, created_at in hist:
+            status = "✅ Sim" if int(gasto) == 1 else "⬜ Não"
+            detalhe = ""
+            if int(gasto) == 1:
+                parts = []
+                if motivo:
+                    parts.append(motivo)
+                if momento:
+                    parts.append(momento)
+                detalhe = f" — {' / '.join(parts)}" if parts else ""
+            st.write(f"**{dt_ref}** — {status}{detalhe}")
 
-    if len(hist) > 20:
-        with st.expander("Ver mais"):
-            for dt_ref_i, gasto_i, motivo_i, momento_i, _created_at in hist[20:]:
-                status = "✅ Sim" if int(gasto_i) == 1 else "⬜ Não"
-                extras = []
-                if motivo_i:
-                    extras.append(motivo_i)
-                if momento_i:
-                    extras.append(momento_i.lower())
-                extra_txt = f" • " + " • ".join(extras) if extras else ""
-                st.write(f"**{dt_ref_i}** — {status}{extra_txt}")
+
+def page_admin():
+    # Admin só abre com query param ?admin=1
+    params = st.query_params
+    if str(params.get("admin", "0")) != "1":
+        return
+
+    st.markdown("## Admin (restrito)")
+    if not ADMIN_PASSWORD:
+        st.warning("ADMIN_PASSWORD não configurado nos secrets/env. Configure para liberar admin.")
+        return
+
+    pwd = st.text_input("Senha de admin", type="password")
+    if not pwd:
+        st.info("Digite a senha para acessar.")
+        return
+
+    if pwd != ADMIN_PASSWORD:
+        st.error("Senha incorreta.")
+        return
+
+    st.success("Admin liberado ✅")
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM users")
+    total_users = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM respostas")
+    total_resp = cur.fetchone()[0]
+    st.write(f"**Usuários:** {total_users} | **Respostas:** {total_resp}")
+
+    st.markdown("### Últimas 50 respostas (geral)")
+    cur.execute("""
+        SELECT r.dt_ref, u.email, COALESCE(u.apelido,''), r.gasto_nao_planejado, COALESCE(r.motivo,''), COALESCE(r.momento,''), r.created_at
+        FROM respostas r
+        LEFT JOIN users u ON u.user_key = r.user_key
+        ORDER BY r.created_at DESC
+        LIMIT 50
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        st.write("Sem dados.")
+    else:
+        for dt_ref, email, apelido, gasto, motivo, momento, created_at in rows:
+            who = apelido if apelido else email
+            status = "Sim" if int(gasto) == 1 else "Não"
+            extra = []
+            if motivo:
+                extra.append(motivo)
+            if momento:
+                extra.append(momento)
+            extra_txt = f" ({' / '.join(extra)})" if extra else ""
+            st.write(f"- **{dt_ref}** — **{who}** — **{status}**{extra_txt} — _{created_at}_")
+
+
+# =========================
+# RENDER
+# =========================
+sidebar_account()
+
+main_header()
+
+# mini “navegação”
+tabs = st.tabs(["App", "Reset"])
+with tabs[0]:
+    page_app()
+with tabs[1]:
+    page_reset_password()
+
+# Admin invisível (só com ?admin=1)
+page_admin()
