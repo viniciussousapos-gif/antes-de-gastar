@@ -71,35 +71,38 @@ def init_db():
         );
         """
     )
-    # -------------------------
-    # MIGRAÇÃO (bancos antigos)
-    # -------------------------
-    def _colunas_da_tabela(nome_tabela: str) -> set[str]:
+    # ==============================
+    # MIGRAÇÃO PARA BANCO ANTIGO
+    # ==============================
+    def _colunas(nome_tabela):
         cur.execute(f"PRAGMA table_info({nome_tabela})")
-        return {r[1] for r in cur.fetchall()}  # r[1] = nome da coluna
+        return {c[1] for c in cur.fetchall()}
 
-    cols = _colunas_da_tabela("respostas")
+    cols = _colunas("respostas")
 
-    # Se banco antigo não tem user_key, cria e tenta preencher
     if "user_key" not in cols:
         cur.execute("ALTER TABLE respostas ADD COLUMN user_key TEXT")
-        cols = _colunas_da_tabela("respostas")
 
-        # tenta copiar de possíveis colunas antigas
+        # tenta reaproveitar colunas antigas
         if "user_id" in cols:
-            cur.execute("UPDATE respostas SET user_key = user_id WHERE user_key IS NULL")
-        elif "userId" in cols:
-            cur.execute("UPDATE respostas SET user_key = userId WHERE user_key IS NULL")
+            cur.execute("""
+                UPDATE respostas
+                SET user_key = user_id
+                WHERE user_key IS NULL
+            """)
         elif "user" in cols:
-            cur.execute("UPDATE respostas SET user_key = user WHERE user_key IS NULL")
+            cur.execute("""
+                UPDATE respostas
+                SET user_key = user
+                WHERE user_key IS NULL
+            """)
 
-    # garante índice único (se já existir, SQLite ignora)
-    cur.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_respostas_user_dia
-        ON respostas(user_key, dt_ref);
-        """
-    )
+    # índice único por usuário + dia
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_respostas_user_dia
+        ON respostas(user_key, dt_ref)
+    """)
 
     cur.execute(
         """
