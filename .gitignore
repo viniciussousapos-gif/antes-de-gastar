@@ -1,0 +1,10 @@
+# Banco local
+por_que_gastei.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Ambiente virtual
+venv/
+.env
