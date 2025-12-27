@@ -520,7 +520,7 @@ def page_app():
         "Outro"
     ]
     motivo_sel = st.selectbox("O que mais influenciou esse gasto?", [""] + motivos_opcoes, index=([""] + motivos_opcoes).index(motivo) if motivo in motivos_opcoes else 0)
-    momento_sel = st.radio("Em que momento do dia isso aconteceu?", ["", "Manhã", "Tarde", "Noite"], index=(["", "Manhã", "Tarde", "Noite"].index(momento) if momento in ["Manhã","Tarde","Noite"] else 0), horizontal=True)
+    momento_sel = st.radio("Em que momento do dia isso aconteceu?", [ "Manhã", "Tarde", "Noite"], index=([ "Manhã", "Tarde", "Noite"].index(momento) if momento in ["Manhã","Tarde","Noite"] else 0), horizontal=True)
 
     st.caption("Sugestão: antes do próximo gasto, faça uma pausa curta e pergunte: “isso resolve o que eu estou sentindo agora?”")
 
